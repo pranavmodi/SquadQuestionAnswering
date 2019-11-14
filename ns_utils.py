@@ -29,12 +29,8 @@ class SQuAD(data.Dataset):
     Each item in the dataset is a tuple with the following entries (in order):
         - context_idxs: Indices of the words in the context.
             Shape (context_len,).
-        - context_char_idxs: Indices of the characters in the context.
-            Shape (context_len, max_word_len).
         - question_idxs: Indices of the words in the question.
             Shape (question_len,).
-        - question_char_idxs: Indices of the characters in the question.
-            Shape (question_len, max_word_len).
         - y1: Index of word in the context where the answer begins.
             -1 if no answer.
         - y2: Index of word in the context where the answer ends.
@@ -45,42 +41,39 @@ class SQuAD(data.Dataset):
         data_path (str): Path to .npz file containing pre-processed dataset.
         use_v2 (bool): Whether to use SQuAD 2.0 questions. Otherwise only use SQuAD 1.1.
     """
-    def __init__(self, data_path, use_v2=True):
+    def __init__(self, data_path, batch_size, use_v2=True):
         super(SQuAD, self).__init__()
 
         dataset = np.load(data_path)
-        self.context_idxs = torch.from_numpy(dataset['context_idxs']).long()
-        self.context_char_idxs = torch.from_numpy(dataset['context_char_idxs']).long()
-        self.question_idxs = torch.from_numpy(dataset['ques_idxs']).long()
-        self.question_char_idxs = torch.from_numpy(dataset['ques_char_idxs']).long()
+        
+        self.qas_indices = torch.from_numpy(dataset['qas_indices']).long()
+        self.input_mask = torch.from_numpy(dataset['input_mask']).long()
         self.y1s = torch.from_numpy(dataset['y1s']).long()
         self.y2s = torch.from_numpy(dataset['y2s']).long()
+        self.ids = torch.from_numpy(dataset['ids']).long()
 
         if use_v2:
             # SQuAD 2.0: Use index 0 for no-answer token (token 1 = OOV)
-            batch_size, c_len, w_len = self.context_char_idxs.size()
-            ones = torch.ones((batch_size, 1), dtype=torch.int64)
-            self.context_idxs = torch.cat((ones, self.context_idxs), dim=1)
-            self.question_idxs = torch.cat((ones, self.question_idxs), dim=1)
+            #batch_size, c_len, w_len = self.context_char_idxs.size()
+            num_examples = self.qas_indices.size()[0]
+            # ones = torch.ones((num_examples, 1), dtype=torch.int64)
+            # self.qas_indices = torch.cat((ones, self.qas_indices), dim=1)
 
-            ones = torch.ones((batch_size, 1, w_len), dtype=torch.int64)
-            self.context_char_idxs = torch.cat((ones, self.context_char_idxs), dim=1)
-            self.question_char_idxs = torch.cat((ones, self.question_char_idxs), dim=1)
+            # ones = torch.ones((batch_size, 1, w_len), dtype=torch.int64)
+            # self.context_char_idxs = torch.cat((ones, self.context_char_idxs), dim=1)
+            # self.question_char_idxs = torch.cat((ones, self.question_char_idxs), dim=1)
 
-            self.y1s += 1
-            self.y2s += 1
+            # self.y1s += 1
+            # self.y2s += 1
 
         # SQuAD 1.1: Ignore no-answer examples
-        self.ids = torch.from_numpy(dataset['ids']).long()
         self.valid_idxs = [idx for idx in range(len(self.ids))
                            if use_v2 or self.y1s[idx].item() >= 0]
 
     def __getitem__(self, idx):
         idx = self.valid_idxs[idx]
-        example = (self.context_idxs[idx],
-                   self.context_char_idxs[idx],
-                   self.question_idxs[idx],
-                   self.question_char_idxs[idx],
+        example = (self.qas_indices[idx],
+                   self.input_mask[idx],
                    self.y1s[idx],
                    self.y2s[idx],
                    self.ids[idx])
@@ -574,6 +567,7 @@ def discretize(p_start, p_end, max_len=15, no_answer=False):
         end_idxs (torch.Tensor): Hard predictions for end index.
             Shape (batch_size,)
     """
+    print('the probabs', p_start.min(), p_start.max(), p_end.min(), p_end.max())
     if p_start.min() < 0 or p_start.max() > 1 \
             or p_end.min() < 0 or p_end.max() > 1:
         raise ValueError('Expected p_start and p_end to have values in [0, 1]')
@@ -628,22 +622,20 @@ def convert_tokens(eval_dict, qa_id, y_start_list, y_end_list, no_answer):
         sub_dict (dict): Dictionary UUIDs -> predicted answer text (submission).
     """
     pred_dict = {}
-    sub_dict = {}
     for qid, y_start, y_end in zip(qa_id, y_start_list, y_end_list):
         context = eval_dict[str(qid)]["context"]
         spans = eval_dict[str(qid)]["spans"]
         uuid = eval_dict[str(qid)]["uuid"]
-        if no_answer and (y_start == 0 or y_end == 0):
+        tokens_to_context_map = eval_dict[str(qid)]['tokens_to_context_map']
+        if y_start == 0 or y_end == 0:
             pred_dict[str(qid)] = ''
-            sub_dict[uuid] = ''
         else:
             if no_answer:
                 y_start, y_end = y_start - 1, y_end - 1
-            start_idx = spans[y_start][0]
-            end_idx = spans[y_end][1]
+            start_idx = tokens_to_context_map[str(y_start)][0]
+            end_idx = tokens_to_context_map[str(y_end)][1]
             pred_dict[str(qid)] = context[start_idx: end_idx]
-            sub_dict[uuid] = context[start_idx: end_idx]
-    return pred_dict, sub_dict
+    return pred_dict
 
 
 def metric_max_over_ground_truths(metric_fn, prediction, ground_truths):

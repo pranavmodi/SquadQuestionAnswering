@@ -22,6 +22,13 @@ from zipfile import ZipFile
 from transformers import BertTokenizer
 
 
+def save(filename, obj, message=None):
+    if message is not None:
+        print(f"Saving {message}...")
+        with open(filename, "w") as fh:
+            json.dump(obj, fh)
+
+
 def download_url(url, output_path, show_progress=True):
     class DownloadProgressBar(tqdm):
         def update_to(self, b=1, bsize=1, tsize=None):
@@ -89,100 +96,6 @@ def is_answerable(example):
     return len(example['y2s']) > 0 and len(example['y1s']) > 0
 
 
-# def build_features(args, examples, data_type, out_file, word2idx_dict, char2idx_dict, is_test=False):
-#     para_limit = args.test_para_limit if is_test else args.para_limit
-#     ques_limit = args.test_ques_limit if is_test else args.ques_limit
-#     ans_limit = args.ans_limit
-#     char_limit = args.char_limit
-
-#     def drop_example(ex, is_test_=False):
-#         if is_test_:
-#             drop = False
-#         else:
-#             drop = len(ex["context_tokens"]) > para_limit or \
-#                    len(ex["ques_tokens"]) > ques_limit or \
-#                    (is_answerable(ex) and
-#                     ex["y2s"][0] - ex["y1s"][0] > ans_limit)
-
-#         return drop
-
-#     print(f"Converting {data_type} examples to indices...")
-#     total = 0
-#     total_ = 0
-#     meta = {}
-#     context_idxs = []
-#     context_char_idxs = []
-#     ques_idxs = []
-#     ques_char_idxs = []
-#     y1s = []
-#     y2s = []
-#     ids = []
-#     for n, example in tqdm(enumerate(examples)):
-#         total_ += 1
-
-#         if drop_example(example, is_test):
-#             continue
-
-#         total += 1
-
-#         def _get_word(word):
-#             for each in (word, word.lower(), word.capitalize(), word.upper()):
-#                 if each in word2idx_dict:
-#                     return word2idx_dict[each]
-#             return 1
-
-#         def _get_char(char):
-#             if char in char2idx_dict:
-#                 return char2idx_dict[char]
-#             return 1
-
-#         context_idx = np.zeros([para_limit], dtype=np.int32)
-#         context_char_idx = np.zeros([para_limit, char_limit], dtype=np.int32)
-#         ques_idx = np.zeros([ques_limit], dtype=np.int32)
-#         ques_char_idx = np.zeros([ques_limit, char_limit], dtype=np.int32)
-
-#         for i, token in enumerate(example["context_tokens"]):
-#             context_idx[i] = _get_word(token)
-#         context_idxs.append(context_idx)
-
-#         for i, token in enumerate(example["ques_tokens"]):
-#             ques_idx[i] = _get_word(token)
-#         ques_idxs.append(ques_idx)
-
-#         for i, token in enumerate(example["context_chars"]):
-#             for j, char in enumerate(token):
-#                 if j == char_limit:
-#                     break
-#                 context_char_idx[i, j] = _get_char(char)
-#         context_char_idxs.append(context_char_idx)
-
-#         for i, token in enumerate(example["ques_chars"]):
-#             for j, char in enumerate(token):
-#                 if j == char_limit:
-#                     break
-#                 ques_char_idx[i, j] = _get_char(char)
-#         ques_char_idxs.append(ques_char_idx)
-
-#         if is_answerable(example):
-#             start, end = example["y1s"][-1], example["y2s"][-1]
-#         else:
-#             start, end = -1, -1
-
-#         y1s.append(start)
-#         y2s.append(end)
-#         ids.append(example["id"])
-
-#     np.savez(out_file,
-#              context_idxs=np.array(context_idxs),
-#              ques_idxs=np.array(ques_idxs),
-#              y1s=np.array(y1s),
-#              y2s=np.array(y2s),
-#              ids=np.array(ids))
-#     print(f"Built {total} / {total_} instances of features in total")
-#     meta["total"] = total
-#     return meta
-
-
 def save(filename, obj, message=None):
     if message is not None:
         print(f"Saving {message}...")
@@ -207,9 +120,32 @@ def batchify_indices(indices):
     return batch, att_mask
 
 
+def map_tokens_to_context(context, tokenizer):
+    context_tokens = []
+    tokens_to_context_map = {}
+    ctoks = context.split(' ')
+    current = 0
+    tnum = 0
+    till = 0
+    for ct in ctoks:
+        if ct == '':
+            current += 1
+            continue
+        till = current + len(ct)
+        wtoks = tokenizer.tokenize(ct)
+        context_tokens.extend(wtoks)
+        for i, w in enumerate(wtoks):
+            tokens_to_context_map[tnum + i] = (current, till)
+        tnum += len(wtoks)
+        current = till + 1
+
+    assert len(context_tokens) == len(tokens_to_context_map.keys())
+    return context_tokens, tokens_to_context_map
+
+
 
 def process_file(filename, tokenizer, output_file, batch_size=64, cls='[CLS]', para_limit=384,
-                 pad_token=0, text_limit=512, sep='[SEP]', output_dir='outputdir'):
+                 pad_token=0, text_limit=512, sep='[SEP]', output_dir='outputdir', eval_file=''):
 
     # process = psutil.Process(os.getpid())
     # print(process.memory_info().rss / (1024 * 1024))
@@ -229,15 +165,17 @@ def process_file(filename, tokenizer, output_file, batch_size=64, cls='[CLS]', p
             if qt == ans_tokens[0]:
                 found = True
                 for j, at in enumerate(ans_tokens):
+                    if i + j >= len(qas_tokens):
+                        print('overflow alert', i + j, qt, i)
+                        break
                     if qas_tokens[i + j] != at:
                         found = False
                         break
                 if found:
                     return (i, i+ans_len)
 
-        # print('returning None, span not found')
-        # print(qas_tokens, ans_tokens)
         return None
+
 
     with open(filename, "r") as fh:
         source = json.load(fh)
@@ -248,20 +186,27 @@ def process_file(filename, tokenizer, output_file, batch_size=64, cls='[CLS]', p
         end_positions = []
         file_num = 0
         indices = []
+        input_masks = []
         count = 0
+        counts = []
         num_clipped = 0
+        span_not_found = 0
+        ids = []
+        eval_examples = {}
         for article in tqdm(source["data"]):
             #print('number of paragraphs in article', len(article["paragraphs"]))
             for para in article["paragraphs"]:
                 context = para['context']
-                context_tokens = tokenizer.tokenize(context)
+                #context_tokens = tokenizer.tokenize(context)
+                context_tokens, tokens_to_context_map = map_tokens_to_context(context, tokenizer)
 
                 for qas in para['qas']:
-                    question = qas['question']
+                    id = qas['id']
                     question = qas['question']
 
                     question_tokens = tokenizer.tokenize(question)
-                    max_context_len = text_limit - len(question_tokens) - 2
+
+                    max_context_len = text_limit - len(question_tokens) - 3
 
                     if len(context_tokens) > max_context_len:
                         context_tokens = context_tokens[:max_context_len]
@@ -271,14 +216,26 @@ def process_file(filename, tokenizer, output_file, batch_size=64, cls='[CLS]', p
                     # qas_text = ' '.join([cls, context, sep, question])
                     # qas_tokens = tokenizer.tokenize(qas_text)
 
-                    qas_tokens = [cls] + context_tokens + [sep] + question_tokens
+                    qas_tokens = [cls] + question_tokens + [sep] + context_tokens + [sep]
                     qas_indices = tokenizer.encode(qas_tokens)
+                    ques_inds = tokenizer.encode(question_tokens)
 
+                    ## If the length of context + question is less than text limit,
+                    ## pad the indices with pad_token
+
+                    pad_len = 0
+                    input_mask = [1] * text_limit
                     if len(qas_indices) < text_limit:
                         pad_len = text_limit - len(qas_indices)
                         qas_indices += [pad_token] * pad_len
+                        input_mask[:pad_len] = [0] * pad_len
 
+                    #input_mask = [1]*len(qas_indices) + [0]*pad_len
+                    
+                    input_masks.append(input_mask)
                     indices.append(qas_indices)
+
+                    assert len(input_mask) == len(qas_indices)
 
                     ## For each answer for the question, get the span and insert into list
                     if qas['is_impossible']:
@@ -290,58 +247,45 @@ def process_file(filename, tokenizer, output_file, batch_size=64, cls='[CLS]', p
                         ans_text = ans['text']
                         ans_tokens = tokenizer.tokenize(ans_text)
                         start = ans['answer_start']
-                        span = find_ans_span(qas_tokens, ans_tokens)
+                        span = find_ans_span(context_tokens, ans_tokens)
                         if span is None:
                             span = (-1, -1)
-                        break
-                        
-                        # if len(answers) > 1:
-                        #     print('more than one ansers')
-                        #     print(answers)
-                        #     import sys
-                        #     sys.exit()
-                        # for ans in answers:
-                        #     ans_text = ans['text']
-                        #     ans_tokens = tokenizer.tokenize(ans_text)
-                        #     start = ans['answer_start']
-                        #     span = find_ans_span(qas_tokens, ans_tokens)
-                        #     if span is None:
-                        #         span = (-1, -1)
-                        #     break
+                            span_not_found += 1
 
-                    start_positions.append(span[0])
-                    end_positions.append(span[1])
+                    start_positions.append(span[0] + 1)
+                    end_positions.append(span[1] + 1)
                     count += 1
+                    ids.append(id)
+                    counts.append(count)
 
-                    # if count % batch_size == 0:
-                    #     count = 0
-                    #     batch, att_mask = batchify_indices(indices)
-                    #     #bert_embed = model(batch, attention_mask=att_mask)[0]
-                    #     assert len(start_positions) == bert_embed.size()[0]
-                    #     output_file = 'embedding_' + str(file_num) + '.npz'
-                    #     writeto = os.path.join(output_dir, output_file)
-                    #     with torch.no_grad():
-                    #         np.savez(writeto,
-                    #                  embeddings=bert_embed.detach(),
-                    #                  start_positions=np.array(start_positions),
-                    #                  end_positions=np.array(end_positions))
-                    #     file_num += 1
-                    #     start_positions = []
-                    #     end_positions = []
-                    #     indices = []
-                    #     gc.collect()
+                    eval_examples[str(count)] = {"context": context,
+                                                 "question": question,
+                                                 "input_mask": input_mask,
+                                                 "tokens_to_context_map" : tokens_to_context_map,
+                                                 "spans": span,
+                                                 "answers": ans,
+                                                 "uuid": qas["id"]}
+            #         if count >= 3:
+            #             print('going to break after 1 count')
+            #             break
+            #     break
+            # break
 
         out_file = os.path.join(output_dir, output_file)
-
         print('number of examples', len(indices))
+        print('Saving the out file', out_file)
         np.savez(out_file,
-                 context_idxs=np.array(indices),
+                 qas_indices=np.array(indices),
+                 input_mask=np.array(input_masks),
                  y1s=np.array(start_positions),
-                 y2s=np.array(end_positions))
-        #print(f"Built {total} / {total_} instances of features in total")
+                 y2s=np.array(end_positions),
+                 ids=np.array(counts))
 
-        print(f"Clipped {num_clipped} instances of features in total")
+        eval_file = os.path.join(output_dir, eval_file)
+        save(eval_file, eval_examples, 'Saving eval file: ' + eval_file)
 
+        print(f"Clipped: {num_clipped}")
+        print(f"Span not found: {span_not_found}")
 
 
 
@@ -360,14 +304,15 @@ if __name__ == '__main__':
     # args_.glove_file = os.path.join(glove_dir, os.path.basename(glove_dir) + glove_ext)
     #pre_process(args_)
 
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
 
     train_file = 'data/train-v2.0.json'
     dev_file = 'data/dev-v2.0.json'
 
-    process_file(train_file, tokenizer, output_file='train.npz', batch_size=64,
-                 cls='[CLS]', para_limit=384, sep='[SEP]', output_dir='data')
-
     process_file(dev_file, tokenizer, output_file='dev.npz', batch_size=64, cls='[CLS]',
-                 para_limit=384, sep='[SEP]', output_dir='data')
+                 para_limit=384, sep='[SEP]', output_dir='data', eval_file='dev_eval.json')
+
+    process_file(train_file, tokenizer, output_file='train.npz', batch_size=64,
+                 cls='[CLS]', para_limit=384, sep='[SEP]', output_dir='data', eval_file='train_eval.json')
+
     
