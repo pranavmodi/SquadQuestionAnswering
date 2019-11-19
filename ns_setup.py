@@ -259,6 +259,7 @@ def process_file(filename, tokenizer, output_file, batch_size=64, cls='[CLS]', p
                     counts.append(count)
 
                     eval_examples[str(count)] = {"context": context,
+                                                 "context_length" : len(context_tokens),
                                                  "question": question,
                                                  "input_mask": input_mask,
                                                  "tokens_to_context_map" : tokens_to_context_map,

@@ -247,22 +247,22 @@ class CheckpointSaver:
         self.log = log
         self._print(f"Saver will {'max' if maximize_metric else 'min'}imize {metric_name}...")
 
-    def is_best(self, metric_val):
-        """Check whether `metric_val` is the best seen so far.
+    # def is_best(self, metric_val):
+    #     """Check whether `metric_val` is the best seen so far.
 
-        Args:
-            metric_val (float): Metric value to compare to prior checkpoints.
-        """
-        if metric_val is None:
-            # No metric reported
-            return False
+    #     Args:
+    #         metric_val (float): Metric value to compare to prior checkpoints.
+    #     """
+    #     if metric_val is None:
+    #         # No metric reported
+    #         return False
 
-        if self.best_val is None:
-            # No checkpoint saved yet
-            return True
+    #     if self.best_val is None:
+    #         # No checkpoint saved yet
+    #         return True
 
-        return ((self.maximize_metric and self.best_val < metric_val)
-                or (not self.maximize_metric and self.best_val > metric_val))
+    #     return ((self.maximize_metric and self.best_val < metric_val)
+    #             or (not self.maximize_metric and self.best_val > metric_val))
 
     def _print(self, message):
         """Print a message if logging is enabled."""
@@ -290,12 +290,12 @@ class CheckpointSaver:
         torch.save(ckpt_dict, checkpoint_path)
         self._print(f'Saved checkpoint: {checkpoint_path}')
 
-        if self.is_best(metric_val):
-            # Save the best model
-            self.best_val = metric_val
-            best_path = os.path.join(self.save_dir, 'best.pth.tar')
-            shutil.copy(checkpoint_path, best_path)
-            self._print(f'New best checkpoint at step {step}...')
+        # if self.is_best(metric_val):
+        #     # Save the best model
+        #     self.best_val = metric_val
+        #     best_path = os.path.join(self.save_dir, 'best.pth.tar')
+        #     shutil.copy(checkpoint_path, best_path)
+        #     self._print(f'New best checkpoint at step {step}...')
 
         # Add checkpoint path to priority queue (lowest priority removed first)
         if self.maximize_metric:
@@ -544,7 +544,7 @@ def torch_from_json(path, dtype=torch.float32):
     return tensor
 
 
-def discretize(p_start, p_end, max_len=15, no_answer=False):
+def discretize(p_start, p_end, context_len, max_len=15, no_answer=False):
     """Discretize soft predictions to get start and end indices.
 
     Choose the pair `(i, j)` of indices that maximizes `p1[i] * p2[j]`
@@ -567,35 +567,64 @@ def discretize(p_start, p_end, max_len=15, no_answer=False):
         end_idxs (torch.Tensor): Hard predictions for end index.
             Shape (batch_size,)
     """
-    print('the probabs', p_start.min(), p_start.max(), p_end.min(), p_end.max())
     if p_start.min() < 0 or p_start.max() > 1 \
             or p_end.min() < 0 or p_end.max() > 1:
         raise ValueError('Expected p_start and p_end to have values in [0, 1]')
 
     # Compute pairwise probabilities
+    batch_size = p_start.size()[0]
+
+    for i in range(batch_size):
+        p_start[i, context_len[i]:] = 0
+        p_end[i, context_len[i]:] = 0
+        
     p_start = p_start.unsqueeze(dim=2)
     p_end = p_end.unsqueeze(dim=1)
     p_joint = torch.matmul(p_start, p_end)  # (batch_size, c_len, c_len)
 
+    
+
     # Restrict to pairs (i, j) such that i <= j <= i + max_len - 1
     c_len, device = p_start.size(1), p_start.device
-    is_legal_pair = torch.triu(torch.ones((c_len, c_len), device=device))
-    is_legal_pair -= torch.triu(torch.ones((c_len, c_len), device=device),
+    is_legal_pair = torch.triu(torch.ones((batch_size, c_len, c_len), device=device))
+    is_legal_pair -= torch.triu(torch.ones((batch_size, c_len, c_len), device=device),
                                 diagonal=max_len)
+
     if no_answer:
         # Index 0 is no-answer
         p_no_answer = p_joint[:, 0, 0].clone()
-        is_legal_pair[0, :] = 0
-        is_legal_pair[:, 0] = 0
+        is_legal_pair[:, 0, :] = 0
+        is_legal_pair[:, :, 0] = 0
     else:
         p_no_answer = None
-    p_joint *= is_legal_pair
+
+    for i in range(p_joint.size(0)):
+        is_legal_pair[i, context_len[i]:, context_len[i]:] = 0
+        assert is_legal_pair[i, context_len[i]:, context_len[i]:].sum() == 0
+        p_joint[i, :, :] *= is_legal_pair[i, :, :]
 
     # Take pair (i, j) that maximizes p_joint
     max_in_row, _ = torch.max(p_joint, dim=2)
     max_in_col, _ = torch.max(p_joint, dim=1)
     start_idxs = torch.argmax(max_in_row, dim=-1)
     end_idxs = torch.argmax(max_in_col, dim=-1)
+
+
+    for i in range(batch_size):
+        if start_idxs[i] > context_len[i] or end_idxs[i] > context_len[i]:
+            print('wtf')
+            # print('cell value', p_joint[i, start_idxs[i], end_idxs[i]], )
+            # print('min and max', p_joint.min(), p_joint.max())
+            # print('hello wtf', start_idxs, end_idxs)
+            # print('clen', context_len[i])
+            # print(p_joint[i, context_len[i]:, context_len[i]:].size())
+            # print(p_joint[i, context_len[i]:, context_len[i]:].sum())
+
+        if start_idxs[i] >= context_len[i]:
+            start_idxs[i] = context_len[i] - 1
+        if end_idxs[i] >= context_len[i]:
+            end_idxs[i] = context_len[i] - 1
+            
 
     if no_answer:
         # Predict no-answer whenever p_no_answer > max_prob
@@ -627,6 +656,7 @@ def convert_tokens(eval_dict, qa_id, y_start_list, y_end_list, no_answer):
         spans = eval_dict[str(qid)]["spans"]
         uuid = eval_dict[str(qid)]["uuid"]
         tokens_to_context_map = eval_dict[str(qid)]['tokens_to_context_map']
+
         if y_start == 0 or y_end == 0:
             pred_dict[str(qid)] = ''
         else:
